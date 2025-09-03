@@ -1,6 +1,6 @@
-# Tutorial: Building AVM as an MCP Server with a Generative AI Meeting Scheduler Agent (Azure AI Foundry)
+# Tutorial: Building AVM as an MCP Server **with a Generative AI Meeting Scheduler Agent (Azure AI Foundry, GPT‑5, dotenv, VS Code)**
 
-This end-to-end tutorial builds an **Agent–ViewModel (AVM)** server (HTTP + WebSocket; MCP‑aligned) **and** a **separate agent process** powered by **Azure AI Foundry (Azure OpenAI)**. The agent uses an LLM with **tool calling** to: 1) read participants’ availability, 2) reason about options, 3) propose a meeting slot, and 4) confirm the meeting. You’ll see **intents** (tools), **projections** (resources), **two‑phase readiness**, least‑privilege, and **multi‑client binding** in action.
+This end-to-end tutorial builds an **Agent–ViewModel (AVM)** server (HTTP + WebSocket; MCP‑aligned) **and** a **separate agent process** powered by **Azure AI Foundry** using **GPT‑5**. You’ll use **dotenv** for configuration and follow **VS Code** steps to set up and run everything locally. The agent uses LLM **tool calling** to: 1) read participants’ availability, 2) reason about options, 3) propose a slot, and 4) confirm the meeting. You’ll see **intents** (tools), **projections** (resources), and **multi‑client binding** in action.
 
 > AVM ↔ MCP mapping: **Intents** ≈ Tools (HTTP endpoints) • **Projections** ≈ Resources (WebSocket subscriptions).
 
@@ -8,19 +8,75 @@ This end-to-end tutorial builds an **Agent–ViewModel (AVM)** server (HTTP + We
 
 ## 1) Prerequisites
 
-* Python 3.10+
-* An Azure OpenAI (Azure AI Foundry) deployment with a chat model (e.g., `gpt-4o`/`gpt-35-turbo` equivalent).
-* Environment variables set:
+* **Python** 3.10+
+* **VS Code** with the **Python** extension
+* An **Azure OpenAI (Azure AI Foundry)** resource with a **GPT‑5** chat deployment (name e.g. `gpt-5`).
 
-  * `AZURE_OPENAI_ENDPOINT` (e.g., `https://<your-resource>.openai.azure.com`)
-  * `AZURE_OPENAI_API_KEY`
-  * `AZURE_OPENAI_API_VERSION` (e.g., `2024-07-01-preview`)
-  * `AZURE_OPENAI_DEPLOYMENT` (your model deployment name)
-* Install dependencies:
+### VS Code setup (recommended)
+This part prepares a clean Python environment for the project and lists the exact packages your app needs. The virtual environment keeps dependencies isolated from anything else on your machine. The ```requirements.txt``` file is how you reproducibly install everything later on a teammate’s laptop or in CI/CD.
 
-```bash
-pip install fastapi uvicorn pydantic httpx websockets python-dateutil openai
+It’s needed so everyone runs the same versions of FastAPI, Pydantic, the Azure SDKs, etc., which prevents “works on my machine” bugs. VS Code’s interpreter selection makes sure the editor runs and debugs with your ```.venv.```
+
+1. Open your project folder in VS Code.
+2. Create a virtual environment:
+
+   ```bash
+   python -m venv .venv
+   ```
+3. Select the interpreter: press `Ctrl/Cmd+Shift+P` → **Python: Select Interpreter** → choose **.venv**.
+4. Create **requirements.txt**:
+
+   ```txt
+   fastapi
+   uvicorn
+   pydantic
+   httpx
+   websockets
+   python-dateutil
+   openai
+   python-dotenv
+   azure-ai-agents
+   azure-identity
+   ```
+5. Install dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+6. Create a **.env** file (see below) and ensure VS Code’s terminal loads it (we call `dotenv.load_dotenv()` in code).
+
+£££.env configuration
+
+The ```.env``` file stores secrets and runtime settings such as Azure endpoints, API keys, and sensible defaults for the agent. The code loads this file at startup so your credentials aren’t hard-coded.
+
+It’s needed to keep secrets out of source control and to make switching environments easy. You can point at a different Azure project or model by changing environment variables, not code.
+
+### .env example
+
+Create `.env` in your project root:
+
+```env
+# Azure AI Foundry (Azure OpenAI)
+AZURE_OPENAI_ENDPOINT=https://<your-resource>.openai.azure.com
+AZURE_OPENAI_API_KEY=<your-api-key>
+AZURE_OPENAI_API_VERSION=2024-07-01-preview
+AZURE_OPENAI_DEPLOYMENT=gpt-5
+# Azure AI Foundry Agents SDK project endpoint
+AZURE_AI_PROJECT_ENDPOINT=https://<your-ai-foundry-project-endpoint>
+
+# Agent defaults
+ORGANIZER=organizer@example.com
+PARTICIPANTS=alice@example.com,bob@example.com
+WINDOW_START=2025-09-03T09:00:00
+WINDOW_END=2025-09-03T17:00:00
+TITLE=Design Sync
+
+# Optional AVM base URLs
+AVM_HTTP=http://localhost:8000
+AVM_WS=ws://localhost:8000
 ```
+
+> Tip: add `.env` to `.gitignore`.
 
 ---
 
@@ -32,15 +88,19 @@ avm_scheduler/
   ├── services.py        # Adapters: CalendarService (mock), MeetingService
   ├── avm.py             # Agent–ViewModel: intents, policy, projections
   ├── server.py          # FastAPI app exposing intents + subscriptions
-  ├── agent_llm.py       # Generative AI agent (Azure AI Foundry)
+  ├── agent_llm.py       # Generative AI agent (Azure OpenAI SDK, GPT‑5, dotenv)
+  ├── agent_llm_agentsdk.py # Generative AI agent (Azure AI Foundry Agents SDK)
   └── supervisor.py      # Optional: approves/observes via projections
 ```
 
-> If you already built the earlier server files, you only need to add/replace the agent with `agent_llm.py` below.
+> If you already built earlier files, you only need to add/replace the agent files below and add dotenv usage.
 
 ---
 
 ## 3) Models (models.py)
+This module defines all the structured data that crosses your AVM boundary. Pydantic models like ```FreeBusyIn```, ```ProposeMeetingIn```, and ```MeetingProjection``` describe the shape of requests, responses, and streamed projection updates. ```CommandResult``` is a consistent envelope for success or error outcomes.
+
+It’s needed to validate inputs automatically, generate clear errors for bad data, and make the API predictable for both humans and LLM agents. Strong typing here prevents a whole class of runtime bugs and miscommunications.
 
 ```python
 from pydantic import BaseModel, Field
@@ -98,6 +158,9 @@ class MeetingProjection(BaseModel):
 ---
 
 ## 4) Services / Adapters (services.py)
+These are adapters that mimic real backends. ```CalendarService``` exposes simple “free/busy” reads and lets you add events. ```MeetingService``` stores meetings and their status. In production these would call Microsoft Graph, Google Calendar, or a database; here they’re in-memory so you can run the whole flow locally.
+
+They’re needed because AVM intentionally hides backend complexity from agents. By coding against adapters, you can swap implementations later without touching the ViewModel or the agent.
 
 ```python
 # services.py
@@ -150,6 +213,9 @@ class MeetingService:
 ---
 
 ## 5) AVM Core (avm.py)
+This is the heart of the pattern. ```ProjectionStore``` is a tiny in-memory pub/sub that tracks a projection’s current snapshot and version and pushes diffs to subscribers. ```AgentViewModel``` exposes high-level intents such as ```calendar_freebusy```, ```meeting_propose```, and ```meeting_confirm```. When an intent changes state, the ViewModel publishes a projection update so all clients (agents, UIs, supervisors) stay in sync.
+
+It’s needed to enforce business rules at the boundary (for example, conflict checking before proposing a meeting), to keep agents on least-privilege rails (only the shaped data they need), and to support multi-client real-time binding without each client talking to backends directly.
 
 ```python
 # avm.py
@@ -237,6 +303,9 @@ class AgentViewModel:
 ---
 
 ## 6) FastAPI Server (server.py)
+This file turns the AVM into a network service. It exposes each intent as a POST endpoint under ```/intents/*```, and it exposes projections over WebSockets at ```/subscriptions/{projection_id}```. When a client subscribes, it immediately receives the current snapshot, then live diffs as they happen.
+
+It’s needed so your agent can act via HTTP and react via WebSockets. This is also what lets multiple clients subscribe to the same projection and see consistent state without polling.
 
 ```python
 # server.py
@@ -275,7 +344,7 @@ async def subscribe(ws: WebSocket, projection_id: str):
         return
 ```
 
-Run the server:
+Run the server (VS Code terminal with .venv active):
 
 ```bash
 uvicorn server:app --reload
@@ -283,59 +352,121 @@ uvicorn server:app --reload
 
 ---
 
-## 7) Generative AI Agent (agent\_llm.py) — Azure AI Foundry
+## 7) Generative AI Agent (agent\_llm\_agentsdk.py) — GPT‑5 + dotenv + **Azure AI Foundry Agents SDK**
+
+This is the generative agent that runs as a separate process. It defines three function tools that call your AVM intents over HTTP. With the Agents SDK, the LLM can automatically decide to call those tools, reason over the returned data, and then continue the conversation. The script seeds a conversation with scheduling context, streams the run, and starts listening to the meeting’s projection once it’s created.
+
+It’s needed to connect LLM reasoning to safe, auditable actions. The agent never touches backends; it only calls the typed tools you exposed. That separation makes it easier to review, log, and test actions while still getting the benefits of GPT-5’s planning and language skills.
+
+Below is a version of the agent implemented with the **Azure AI Foundry Agents SDK** (the new agent framework). It registers your AVM intents as **function tools**, lets the SDK **auto‑invoke** them, and streams results.
+
+> One‑time install (VS Code terminal): `pip install azure-ai-agents azure-identity`
+
+Add this file as `agent_llm_agentsdk.py`:
 
 ```python
-# agent_llm.py
-import os, json, asyncio, uuid
-import httpx, websockets
-from openai import AzureOpenAI
+# agent_llm_agentsdk.py
+import os, json, uuid, asyncio, httpx, websockets
+from dotenv import load_dotenv
+from azure.identity import DefaultAzureCredential
+from azure.ai.agents.aio import AgentsClient
+from azure.ai.agents.tool import AsyncFunctionTool, AsyncToolSet
+from azure.ai.agents.models import MessageRole
 
-AVM_HTTP = "http://localhost:8000"
-AVM_WS   = "ws://localhost:8000"
+load_dotenv()  # loads .env
 
-client = AzureOpenAI(
-    api_key=os.environ["AZURE_OPENAI_API_KEY"],
-    api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-07-01-preview"),
-    azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-)
-MODEL = os.environ["AZURE_OPENAI_DEPLOYMENT"]
+# --- AVM endpoints ---
+AVM_HTTP = os.getenv("AVM_HTTP", "http://localhost:8000")
+AVM_WS   = os.getenv("AVM_WS",   "ws://localhost:8000")
 
-ORGANIZER = "organizer@example.com"
-PARTICIPANTS = ["alice@example.com", "bob@example.com"]
-WINDOW_START = "2025-09-03T09:00:00"
-WINDOW_END   = "2025-09-03T17:00:00"
-TITLE        = "Design Sync"
+# --- Azure AI Foundry Agents SDK ---
+# Use your Azure AI Foundry **project endpoint** (Project > Overview > Endpoint)
+AZURE_AI_PROJECT_ENDPOINT = os.environ["AZURE_AI_PROJECT_ENDPOINT"]
+MODEL = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5")
 
-TOOLS = [
-    {"type": "function", "function": {"name": "calendar_freebusy", "description": "Get busy intervals", "parameters": {"type": "object", "properties": {"participants": {"type": "array", "items": {"type": "string"}}, "window_start_iso": {"type": "string"}, "window_end_iso": {"type": "string"}}, "required": ["participants","window_start_iso","window_end_iso"]}}},
-    {"type": "function", "function": {"name": "propose_meeting", "description": "Propose meeting slot", "parameters": {"type": "object", "properties": {"organizer": {"type": "string"}, "participants": {"type": "array", "items": {"type": "string"}}, "start_iso": {"type": "string"}, "end_iso": {"type": "string"}, "title": {"type": "string"}}, "required": ["organizer","participants","start_iso","end_iso"]}}},
-    {"type": "function", "function": {"name": "confirm_meeting", "description": "Confirm meeting", "parameters": {"type": "object", "properties": {"meeting_id": {"type": "string"}}, "required": ["meeting_id"]}}},
-]
+credential = DefaultAzureCredential()
 
-async def calendar_freebusy(args):
+# --- Domain defaults from .env ---
+ORGANIZER     = os.environ.get("ORGANIZER", "organizer@example.com")
+PARTICIPANTS  = os.environ.get("PARTICIPANTS", "alice@example.com,bob@example.com").split(",")
+WINDOW_START  = os.environ.get("WINDOW_START", "2025-09-03T09:00:00")
+WINDOW_END    = os.environ.get("WINDOW_END",   "2025-09-03T17:00:00")
+TITLE         = os.environ.get("TITLE", "Design Sync")
+
+# ---- Tool implementations that call AVM intents ----
+async def tool_calendar_freebusy(participants: list[str], window_start_iso: str, window_end_iso: str) -> dict:
+    payload = {"participants": participants, "window_start_iso": window_start_iso, "window_end_iso": window_end_iso}
     async with httpx.AsyncClient() as http:
-        r = await http.post(f"{AVM_HTTP}/intents/calendar.freebusy", json=args, timeout=15)
+        r = await http.post(f"{AVM_HTTP}/intents/calendar.freebusy", json=payload, timeout=15)
         r.raise_for_status()
         return r.json()
 
-async def propose_meeting(args):
-    payload = {"organizer": args["organizer"], "participants": args["participants"], "slot": {"start_iso": args["start_iso"], "end_iso": args["end_iso"]}, "title": args.get("title", TITLE), "idem_key": str(uuid.uuid4())}
+async def tool_propose_meeting(organizer: str, participants: list[str], start_iso: str, end_iso: str, title: str | None = None) -> dict:
+    payload = {"organizer": organizer, "participants": participants, "slot": {"start_iso": start_iso, "end_iso": end_iso}, "title": title or TITLE, "idem_key": str(uuid.uuid4())}
     async with httpx.AsyncClient() as http:
         r = await http.post(f"{AVM_HTTP}/intents/meeting.propose", json=payload, timeout=15)
         r.raise_for_status()
         return r.json()
 
-async def confirm_meeting(args):
-    payload = {"meeting_id": args["meeting_id"], "idem_key": str(uuid.uuid4())}
+async def tool_confirm_meeting(meeting_id: str) -> dict:
+    payload = {"meeting_id": meeting_id, "idem_key": str(uuid.uuid4())}
     async with httpx.AsyncClient() as http:
         r = await http.post(f"{AVM_HTTP}/intents/meeting.confirm", json=payload, timeout=15)
         r.raise_for_status()
         return r.json()
 
-TOOL_IMPL = {"calendar_freebusy": calendar_freebusy, "propose_meeting": propose_meeting, "confirm_meeting": confirm_meeting}
+# ---- Register tools with schemas (auto function calling) ----
+functions = AsyncFunctionTool([
+    {
+        "name": "calendar_freebusy",
+        "description": "Get busy intervals for participants within a time window.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "participants": {"type": "array", "items": {"type": "string"}},
+                "window_start_iso": {"type": "string"},
+                "window_end_iso": {"type": "string"}
+            },
+            "required": ["participants", "window_start_iso", "window_end_iso"]
+        },
+        "code": tool_calendar_freebusy,
+    },
+    {
+        "name": "propose_meeting",
+        "description": "Propose a meeting slot and return meeting_id on success.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "organizer": {"type": "string"},
+                "participants": {"type": "array", "items": {"type": "string"}},
+                "start_iso": {"type": "string"},
+                "end_iso": {"type": "string"},
+                "title": {"type": "string"}
+            },
+            "required": ["organizer", "participants", "start_iso", "end_iso"]
+        },
+        "code": tool_propose_meeting,
+    },
+    {
+        "name": "confirm_meeting",
+        "description": "Confirm a previously proposed meeting.",
+        "parameters": {
+            "type": "object",
+            "properties": {"meeting_id": {"type": "string"}},
+            "required": ["meeting_id"]
+        },
+        "code": tool_confirm_meeting,
+    },
+])
 
-SYSTEM_PROMPT = ("You are a careful scheduling agent. Find a 30-minute slot where ALL participants are free between the given window. Prefer earlier times. Then propose it via tools. If proposal is ok, confirm it. Respond with short status updates; always use the provided tools to act.")
+toolset = AsyncToolSet()
+toolset.add(functions)
+
+SYSTEM_INSTRUCTIONS = (
+    "You are a careful scheduling agent. Find the earliest 30-minute slot where ALL participants are free "
+    "between the provided window. Call tools to check free/busy, then propose the slot. If accepted, confirm the meeting. "
+    "Be concise in messages."
+)
 
 async def subscribe_meeting(meeting_id: str):
     uri = f"{AVM_WS}/subscriptions/meeting:{meeting_id}"
@@ -344,48 +475,61 @@ async def subscribe_meeting(meeting_id: str):
             print("[projection]", json.loads(msg))
 
 async def main():
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": json.dumps({"organizer": ORGANIZER, "participants": PARTICIPANTS, "window_start_iso": WINDOW_START, "window_end_iso": WINDOW_END, "duration_minutes": 30, "title": TITLE})}
-    ]
+    agents = AgentsClient(endpoint=AZURE_AI_PROJECT_ENDPOINT, credential=credential)
+    # Enable auto function calls so the SDK executes our functions when the model requests them
+    agents.enable_auto_function_calls(toolset)
+
+    # Create agent with tools attached
+    agent = await agents.create_agent(
+        model=MODEL,
+        name="scheduler-agent",
+        instructions=SYSTEM_INSTRUCTIONS,
+        toolset=toolset,
+    )
+
+    # Create a conversation thread and seed it with scheduling context
+    thread = await agents.threads.create()
+    user_payload = {
+        "organizer": ORGANIZER,
+        "participants": PARTICIPANTS,
+        "window_start_iso": WINDOW_START,
+        "window_end_iso": WINDOW_END,
+        "duration_minutes": 30,
+        "title": TITLE,
+    }
+    await agents.messages.create(thread_id=thread.id, role=MessageRole.USER, content=json.dumps(user_payload))
+
+    # Stream processing (SDK will invoke our tools automatically)
     meeting_id = None
-    while True:
-        resp = client.chat.completions.create(model=MODEL, messages=messages, tools=TOOLS, tool_choice="auto", temperature=0.1)
-        choice = resp.choices[0]
-        tool_calls = getattr(choice.message, "tool_calls", None) or []
-        if tool_calls:
-            for call in tool_calls:
-                name = call.function.name
-                args = json.loads(call.function.arguments or "{}")
-                print(f"[LLM->tool] {name} {args}")
-                result = await TOOL_IMPL[name](args)
-                messages.append({"role": "tool", "name": name, "content": json.dumps(result)})
-                if name == "propose_meeting" and result.get("ok"):
-                    meeting_id = result.get("correlation_id")
+    async with agents.runs.stream(thread_id=thread.id, agent_id=agent.id) as stream:
+        async for event_type, event_data, _ in stream:
+            print(event_type, getattr(event_data, "status", ""))
+            if hasattr(event_data, "text"):
+                print("[agent]", getattr(event_data, "text", None))
+            if hasattr(event_data, "output") and isinstance(event_data.output, dict):
+                mid = event_data.output.get("correlation_id")
+                if mid and not meeting_id:
+                    meeting_id = mid
                     asyncio.create_task(subscribe_meeting(meeting_id))
-            continue
-        else:
-            print("[LLM]", choice.message.content)
-            if meeting_id:
-                conf = await confirm_meeting({"meeting_id": meeting_id})
-                print("[agent] confirmed:", conf)
-            break
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-Run the agent:
+Run (VS Code terminal, `.venv` active):
 
 ```bash
-AZURE_OPENAI_ENDPOINT=... AZURE_OPENAI_API_KEY=... \
-AZURE_OPENAI_API_VERSION=2024-07-01-preview AZURE_OPENAI_DEPLOYMENT=... \
-python agent_llm.py
+python agent_llm_agentsdk.py
 ```
+
+If the SDK is not auto‑calling functions in your environment, switch to `runs.create_and_process(...)` instead of streaming, or verify your `.env` contains `AZURE_AI_PROJECT_ENDPOINT` and your identity has access to the Azure AI Foundry project.
 
 ---
 
 ## 8) Optional Supervisor (supervisor.py)
+This tiny script opens a WebSocket to a meeting projection and prints every update. It behaves like a simple “second client,” which could be a human dashboard or another automation.
+
+It’s needed to demonstrate multi-client binding. Because projections are broadcast, any number of clients can watch the same state and act accordingly, which is useful for human-in-the-loop approval flows or monitoring.
 
 ```python
 # supervisor.py
@@ -405,35 +549,46 @@ if __name__ == "__main__":
 
 ---
 
-## 9) End-to-End Test
+## 9) End-to-End Test (VS Code workflow)
+The test steps start the AVM server and the agent in separate terminals. You should see the agent call ```calendar.freebusy```, propose a slot, subscribe to the projection, and confirm the meeting. The ```launch.json``` snippet lets VS Code run the server with your ```.env``` loaded.
 
-1. Start the server:
+It’s needed to verify the full round-trip: intent calls, projection updates, and the agent’s tool-driven actions. Once this works locally, you can replace the mock services with real adapters and keep the rest unchanged.
 
-   ```bash
-   uvicorn server:app --reload
-   ```
-2. Start the agent:
+1. Open folder → ensure **.venv** interpreter is selected.
+2. `uvicorn server:app --reload` to start AVM server.
+3. New terminal → run either agent:
 
-   ```bash
-   AZURE_OPENAI_ENDPOINT=... AZURE_OPENAI_API_KEY=... \
-   AZURE_OPENAI_API_VERSION=2024-07-01-preview AZURE_OPENAI_DEPLOYMENT=... \
-   python agent_llm.py
-   ```
-3. Observe the console:
+   * **Azure OpenAI SDK** variant: `python agent_llm.py`
+   * **Azure AI Foundry Agents SDK** variant: `python agent_llm_agentsdk.py`
+4. Watch logs: tool calls to `calendar.freebusy` → `meeting.propose` → projection updates → `meeting.confirm`.
 
-   * LLM calls `calendar_freebusy`, reasons about options, calls `propose_meeting`.
-   * Projection `meeting:M-*` is created and broadcast; agent subscribes and prints updates.
-   * Agent confirms the meeting if appropriate.
+(Optional) Create a **launch.json** for server:
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "AVM Server",
+      "type": "python",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["server:app", "--reload"],
+      "envFile": "${workspaceFolder}/.env"
+    }
+  ]
+}
+```
 
 ---
 
 ## 10) Production Notes & Next Steps
 
-* **Boundary safety**: LLM acts only through typed AVM tools.
+* **Boundary safety**: LLM acts only via typed AVM tools.
 * **Multi‑client**: Agents and UIs subscribe to the same projections.
-* **Azure AI Foundry**: Swap in your deployment; add content filters and logging.
+* **dotenv**: Centralizes env config; pair with secret storage in production.
 * Add **two‑phase participant approvals** and per‑client scopes/rate limits.
 * Use **durable pub/sub** (Redis/NATS) behind the Projection Store for scale.
 * Integrate Microsoft Graph/Google Calendar adapters and optimistic concurrency.
 
-You now have a realistic AVM server and a **generative AI scheduling agent** using **Azure AI Foundry** tool calling in a separate process.
+You now have a realistic AVM server and a **GPT‑5 scheduling agent** using either the classic Azure OpenAI SDK or the **Azure AI Foundry Agents SDK**, configured via **dotenv**, runnable end‑to‑end in **VS Code**.

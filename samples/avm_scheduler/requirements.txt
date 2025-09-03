@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+httpx
+websockets
+python-dateutil
+openai
+python-dotenv
+azure-ai-agents
+azure-identity
