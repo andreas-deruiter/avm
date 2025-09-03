@@ -2,75 +2,104 @@
 
 ## Intent
 
-Expose a narrow, policy-enforced capability surface to an agent so it can perceive and act on a complex system safely and effectively, without seeing the underlying domain model or infrastructure.
+Provide a single, simplified capability surface where agents and other clients safely interact with complex systems. The AVM boundary hides domain complexity, enforces policy and least privilege, and exposes only meaningful intents and compact read models. It also maintains a shared live projection of state so multiple clients—automation agents, supervisory agents, and human UIs—can coordinate in real time: one client can act, another can observe or intervene, and everyone stays synchronized automatically.
 
 ## Also Known As
 
-Agent Facade, Capability Surface, Anti-Corruption Layer for Agents, Ports-and-Adapters for LLMs.
+Agent Facade; Capability Surface; Anti-Corruption Layer for Agents; Ports-and-Adapters for LLMs; Reactive Read-Model for Agents.
 
 ## Motivation
 
-Agents reason better when their world is small, stable, and typed. Enterprise systems are the opposite: heterogeneous, noisy, and permissioned. AVM interposes a purposeful layer that turns messy backends into a compact set of intents with clear inputs, outputs, and errors. The agent binds to this surface (as function/tools), while AVM enforces validation, policy, idempotency, and translation. You get least-privilege execution, predictable retries, lower token usage, and testable behavior.
+Real systems are heterogeneous, permissioned, and messy; agents reason best over small, typed, and stable worlds. AVM introduces a boundary that presents high-level intents with strict contracts and emits a live projection of state. Successful actions update that projection so all subscribers immediately see the change, enabling automation with oversight and human-in-the-loop approvals without leaking backend details.
+
+### Example: Defining an Intent
+
+```python
+class UpdateStatusIn(BaseModel):
+    id: str
+    to: Literal["Open","InProgress","Done"]
+    precondition_version: int
+    idem_key: str
+
+@app.post("/intents/ticket.update_status", response_model=CommandResult)
+async def ticket_update_status(args: UpdateStatusIn):
+    return await avm.update_status(args)
+```
+
+This snippet shows an **intent** exposed via the AVM boundary: strictly typed input, predictable output, clear semantics.
 
 ## Applicability
 
-Use AVM whenever an agent must read or change state in one or more real systems; when you must prevent schema or policy drift from leaking into prompts; when long-running operations require job orchestration; or when safety, auditability, and deterministic retries matter.
+Use AVM when agents or human users must read or change state in one or more real systems; when safety, auditability, deterministic retries, or approvals matter; when multiple clients need to coordinate; or when changes must be visible in real time across participants.
 
 ## Structure
 
 ```
-Agent  ⇄  Agent–ViewModel  ⇄  Services/Adapters  ⇄  Domain Model & External Systems
-  |           |                     |                          |
-  |     typed tools                 | mapping, retries         | data, side effects
-  |     read models                 | policy, ACL, caching     | authoritative truth
+Clients (Automation Agent, Supervisor Agent, Human UI)
+   ⇄  Subscriptions (Projections, Diffs, Events)
+   ⇄  Agent–ViewModel (Intents, Policy, Validation, Error mapping)
+   ⇄  Command/Job Coordinator (Idempotency, Two-Phase, Sagas)
+   ⇄  Services/Adapters (Auth, Retries, Mapping)
+   ⇄  Domain Model & External Systems (authoritative truth)
 ```
+
+### Example: Subscribing to a Projection
+
+```python
+@app.websocket("/subscriptions/{projection_id}")
+async def subscribe(ws: WebSocket, projection_id: str):
+    await ws.accept()
+    queue = await projection_store.subscribe(projection_id)
+    try:
+        while True:
+            ev: ProjectionEvent = await queue.get()
+            await ws.send_json(ev.model_dump())
+    except WebSocketDisconnect:
+        return
+```
+
+Here, multiple clients bind to the same **projection**; when state changes, all subscribers receive updates immediately.
 
 ## Participants
 
-The Agent consumes only AVM tools and read models. The Agent–ViewModel defines intent-level commands and queries, applies validation and policy, normalizes data, and guards side effects with idempotency and audits. Services/Adapters hide protocols and vendors, handling auth, pagination, retries, and transformation. The Domain Model and external systems remain unexposed to the agent.
+Clients subscribe to projections and invoke intents. The Agent–ViewModel defines contracts, validates input, enforces policy and scopes, normalizes data, and guards side effects with idempotency and audit. A Projection Store materializes reasoning-friendly views and publishes updates. A Command/Job Coordinator handles idempotency, long-running jobs, and two-phase approvals. Services/Adapters encapsulate protocol, retries, and mappings to the real systems, which remain hidden and authoritative.
 
 ## Collaborations
 
-The agent issues a query or command; AVM validates, authorizes, and either returns a summarized read model or executes an idempotent command via services. Long tasks return a job identifier; the agent polls status through AVM. Errors are mapped to a small, stable taxonomy so the agent can recover.
+A client subscribes to a projection to receive an initial snapshot and subsequent diffs. It invokes an intent through the AVM with a precondition version and an idempotency key. The AVM validates and authorizes, then either executes synchronously, starts a job with progress updates, or opens a two-phase hold for approval. On success or meaningful progress, the AVM updates the projection and publishes an event so all subscribers immediately see consistent state. Conflicts and approvals surface as small, predictable error codes so clients can recover deterministically.
+
+### Example: Two-Phase Command
+
+```python
+@app.post("/intents/order.propose_change", response_model=CommandResult)
+async def propose_change(args: ProposeIn):
+    res = await coordinator.propose_change(args.target_id, args.patch, args.idem_key)
+    await projection_store.update(f"order:{args.target_id}", {"pending_patch": args.patch})
+    return res
+```
+
+An automation agent can **propose** a change. A human or supervisory agent can later **commit** or **cancel** it; everyone sees pending state in the projection.
 
 ## Consequences
 
-AVM improves safety, clarity, and testability by shrinking the agent’s world and enforcing policy at one choke point. It reduces token cost and prompt brittleness by providing compact read models. It also adds a layer to design and maintain, and you must version the surface as capabilities evolve.
+You gain safe automation with oversight, a stable minimal surface for agents, deterministic retries and auditing, and lower token and cognitive load via compact projections. You take on a lightweight eventing substrate, projection versioning, and explicit concurrency semantics at the boundary. Versioned contracts keep clients stable as capabilities evolve.
 
 ## Implementation
 
-Design the surface around intents rather than endpoints. Define strict schemas for every tool and read model, including explicit error codes and invariants. Enforce least privilege and data redaction at the AVM boundary. Make commands idempotent with keys and return correlation ids for audit. Represent long-running work as jobs with start and get\_status. Cache and cap results to predictable sizes. Version your AVM contracts and keep adapters thin and swappable. Unit-test AVM in isolation and run conversation-level tests with golden transcripts.
+Design around intents rather than endpoints. Define strict schemas for commands, queries, projections, events, and errors. Enforce least privilege and redact sensitive data at the boundary. Make commands idempotent with keys and use versioned preconditions. Represent long work as jobs with start and get\_status and publish progress into projections. Use two-phase commands for human approvals. Provide per-client capability profiles without cloning ViewModels. Keep adapters thin and swappable. Test contracts in isolation and run golden conversation tests for happy paths, conflicts, jobs, and interventions.
 
-## Sample Code
+### Example: Long-Running Job
 
-```ts
-// Tool contracts: the agent only sees these.
-type Ticket = { id: string; title: string; status: "Open"|"InProgress"|"Done"; priority_score: number };
-type SearchTickets = (args: { query: string; assignee?: string; limit?: number }) => Promise<{ items: Ticket[] }>;
-type UpdateStatus = (args: { id: string; to: "Open"|"InProgress"|"Done"; idem_key: string }) => Promise<{ ok: true }>;
-type StartExport = (args: { query: string }) => Promise<{ job_id: string }>;
-type GetJobStatus = (args: { job_id: string }) => Promise<{ state: "Queued"|"Running"|"Succeeded"|"Failed"; url?: string; error_code?: string }>;
-
-class AgentViewModel {
-  constructor(private tickets: TicketService, private audit: Audit) {}
-  async searchTickets(a): Promise<{items: Ticket[]}> {
-    const q = sanitize(a.query); const n = Math.min(a.limit ?? 20, 50);
-    const rows = await this.tickets.search({ q, assignee: a.assignee, limit: n });
-    return { items: rows.map(r => ({ id: r.id, title: r.title, status: mapStatus(r), priority_score: rank(r) })) };
-  }
-  async updateStatus(a): Promise<{ok:true}> {
-    requireOneOf(a, ["id","to","idem_key"]); authorize("ticket.update", a.id);
-    await this.tickets.updateStatus({ id: a.id, to: a.to, idem_key: a.idem_key });
-    this.audit.log("ticket.update_status", a);
-    return { ok: true };
-  }
-}
+```python
+@app.post("/jobs/start", response_model=JobState)
+async def start_job(args: StartJobIn):
+    job = await coordinator.start_job(args.kind, args.target_id, args.idem_key)
+    await projection_store.update(f"job:{args.idem_key}", job.model_dump())
+    return job
 ```
 
-## Known Uses
-
-Internal copilots that operate over ticketing, CRM, knowledge bases, and DevOps commonly use an AVM surface to expose a handful of safe verbs and summarized views while insulating the agent from vendor APIs and raw schemas.
+This shows a **job intent** where clients can start long-running tasks and watch progress via projection updates.
 
 ## Related Patterns
 
-Facade simplifies a subsystem much like AVM simplifies backends for an agent. Hexagonal Architecture (ports and adapters) underpins the separation between AVM and services. Anti-Corruption Layer prevents foreign models from leaking into the agent surface. CQRS aligns with AVM’s split between compact read models and narrow commands. Saga supports multi-step, compensable workflows behind AVM.
+Facade, Hexagonal Architecture (Ports-and-Adapters), Anti-Corruption Layer, CQRS, Saga, Observer/Publish-Subscribe, Optimistic Concurrency.
