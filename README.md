@@ -1,13 +1,8 @@
 
 
-# AVM: Abstract View Model Design Pattern
+# AVM: Agent View Model Design Pattern
 
-**AVM (Abstract View Model)** is a software design pattern that separates the representation of information (the "View Model") from the user interface (the "View"). This separation enables modular, maintainable, and testable code, and is especially useful for building scalable applications and AI agents.
-
-## What is AVM?
-AVM provides a structured approach to organizing application logic by defining clear boundaries between:
-- **View Model**: The abstract representation of the application's state and logic.
-- **View**: The user interface or presentation layer that interacts with the user.
+**AVM (Agent View Model)** is a software design pattern that separates the representation of information (the "View Model") from the user interface (the "View"). This separation enables modular, maintainable, and testable code, and is especially useful for building scalable applications and AI agents.
 
 This pattern makes it easier to manage complex projects, test business logic independently, and adapt the UI to different platforms or technologies.
 

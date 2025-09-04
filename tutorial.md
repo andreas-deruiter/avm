@@ -93,8 +93,6 @@ avm_scheduler/
   └── supervisor.py      # Optional: approves/observes via projections
 ```
 
-> If you already built earlier files, you only need to add/replace the agent files below and add dotenv usage.
-
 ---
 
 ## 3) Models (models.py)
