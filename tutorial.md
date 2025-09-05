@@ -45,7 +45,7 @@ It’s needed so everyone runs the same versions of FastAPI, Pydantic, the Azure
    ```
 6. Create a **.env** file (see below) and ensure VS Code’s terminal loads it (we call `dotenv.load_dotenv()` in code).
 
-£££.env configuration
+###.env configuration
 
 The ```.env``` file stores secrets and runtime settings such as Azure endpoints, API keys, and sensible defaults for the agent. The code loads this file at startup so your credentials aren’t hard-coded.
 
